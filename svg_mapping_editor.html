@@ -1,0 +1,169 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SVG Mapping Editor - Cycle Under Cursor</title>
+<style>
+body{margin:0;font-family:Arial,sans-serif}.app{display:grid;grid-template-columns:360px 1fr;height:100vh}
+aside{padding:12px;background:#f7f7f7;border-right:1px solid #ddd;overflow:auto}main{overflow:auto;padding:12px}
+input,select,button,textarea{width:100%;box-sizing:border-box;margin:4px 0;padding:7px}
+textarea{height:150px;font-family:monospace;font-size:12px}.row{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.hint{font-size:12px;color:#555}.mono{font-family:monospace;word-break:break-all}
+.box{border:1px solid #ddd;background:white;border-radius:4px;padding:8px;font-size:12px}
+.item,.hit{display:grid;grid-template-columns:1fr auto;gap:4px;align-items:center;border:1px solid #ddd;background:white;margin:4px 0;padding:4px;border-radius:4px}
+.hit{grid-template-columns:auto 1fr;cursor:pointer}.hit.active{border-color:#008cff;background:#eef7ff}
+button.primary{background:#fff0e8;border-color:#ff9b72}button.danger{background:#fff2f2;border-color:#e8a0a0}button:disabled{opacity:.5}
+#stage{min-width:2200px}#stage svg *{pointer-events:all!important}
+#stage .selected{stroke:#ff4d00!important;stroke-opacity:1!important}
+#stage .hover{stroke:#008cff!important;stroke-opacity:1!important}
+#stage .clicked{stroke:#00a85a!important;stroke-opacity:1!important}
+#stage text.selected,#stage tspan.selected{fill:#cc3300!important;stroke:none!important;font-weight:bold}
+#stage text.clicked,#stage tspan.clicked{fill:#00a85a!important;stroke:none!important}
+</style>
+
+<div class="app">
+<aside>
+<h2>SVG Mapping Editor</h2>
+<p class="hint">Click SVG once to collect all elements under the cursor. Re-click the same spot or use Next/Previous to cycle through hidden/overlapped IDs.</p>
+
+<label>SVG</label><input id="svgFile" type="file" accept=".svg,image/svg+xml">
+<label>Mapping JSON</label><input id="mapFile" type="file" accept=".json,application/json">
+
+<label>Filter / code</label><input id="filter" placeholder="A14">
+<select id="codes" size="7"></select>
+<div class="row"><button id="newCode">New code</button><button id="delCode" class="danger">Delete code</button></div>
+
+<h3>Chosen element</h3>
+<div class="box">
+  <div>ID: <span id="clickedId" class="mono">none</span></div>
+  <div>Tag: <span id="clickedTag" class="mono">none</span></div>
+  <div>Stack: <span id="stackInfo">0 / 0</span></div>
+</div>
+<div class="row"><button id="prevHit" disabled>Previous</button><button id="nextHit" disabled>Next</button></div>
+<div class="row"><button id="add" class="primary" disabled>Add ID</button><button id="replace" class="primary" disabled>Replace</button></div>
+<button id="remove" class="danger" disabled>Remove ID</button>
+
+<h3>Elements under cursor</h3><div id="hits" class="hint">Click the SVG.</div>
+<h3>Mapped IDs</h3><div id="ids"></div>
+<h3>JSON</h3><textarea id="json"></textarea>
+<button id="apply">Apply JSON edits</button>
+<button id="download" class="primary">Download mapping JSON</button>
+<h3>Status</h3><div id="status" class="box">Waiting for files.</div>
+</aside>
+<main><div id="stage">SVG preview appears here.</div></main>
+</div>
+
+<script>
+let svg=null, mapping={}, code=null, chosen=null, stack=[], idx=-1, last=null;
+const $=id=>document.getElementById(id);
+const status=s=>$("status").textContent=s;
+const sortCodes=()=>Object.keys(mapping).sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}));
+function norm(raw){ if(raw && raw.mapping) raw=raw.mapping; let out={}; for(let [k,v] of Object.entries(raw||{})){ out[k]=Array.isArray(v)?[...new Set(v.map(String).filter(Boolean))]:[String(v)]; } return out; }
+function clear(cls){ if(svg) svg.querySelectorAll("."+cls).forEach(e=>e.classList.remove(cls)); }
+function byId(id){ return svg&&id ? svg.querySelector("#"+CSS.escape(id)) : null; }
+
+function refreshCodes(){
+  let q=$("filter").value.trim().toUpperCase(); $("codes").innerHTML="";
+  for(let c of sortCodes()){
+    if(q && !c.toUpperCase().includes(q)) continue;
+    let o=document.createElement("option"); o.value=c; o.textContent=c+" ("+(mapping[c]||[]).length+")"; if(c===code)o.selected=true; $("codes").appendChild(o);
+  }
+  if(!code && $("codes").options.length){ code=$("codes").options[0].value; $("codes").value=code; }
+}
+function highlightMapped(){
+  if(!svg)return; clear("selected");
+  for(let id of (mapping[code]||[])){ let e=byId(id); if(e)e.classList.add("selected"); }
+}
+function renderIds(){
+  let box=$("ids"); box.innerHTML="";
+  if(!code){box.innerHTML='<p class="hint">No code selected.</p>';return}
+  let arr=mapping[code]||[];
+  if(!arr.length){box.innerHTML='<p class="hint">No IDs mapped.</p>';return}
+  arr.forEach((id,i)=>{
+    let row=document.createElement("div"); row.className="item";
+    let c=document.createElement("code"); c.className="mono"; c.textContent=id;
+    let btn=document.createElement("button"); btn.textContent="remove"; btn.onclick=()=>{mapping[code].splice(i,1); update();};
+    row.append(c,btn); box.appendChild(row);
+  });
+}
+function renderHits(){
+  let box=$("hits"); box.innerHTML="";
+  if(!stack.length){box.innerHTML='<p class="hint">No SVG IDs under cursor.</p>';return}
+  stack.forEach((el,i)=>{
+    let row=document.createElement("div"); row.className="hit"+(i===idx?" active":""); row.onclick=()=>select(i);
+    let n=document.createElement("b"); n.textContent=String(i+1);
+    let t=document.createElement("span"); t.className="mono"; t.textContent="<"+el.tagName+"> #"+el.id;
+    row.append(n,t); box.appendChild(row);
+  });
+}
+function buttons(){
+  let ok=!!(code&&chosen);
+  $("add").disabled=!ok; $("replace").disabled=!ok; $("remove").disabled=!ok;
+  $("nextHit").disabled=stack.length<2; $("prevHit").disabled=stack.length<2; $("delCode").disabled=!code;
+}
+function update(){ refreshCodes(); renderIds(); renderHits(); highlightMapped(); $("json").value=JSON.stringify(mapping,null,2); buttons(); }
+
+function choose(el){
+  clear("clicked"); chosen=el||null;
+  if(el)el.classList.add("clicked");
+  $("clickedId").textContent=chosen?chosen.id:"none";
+  $("clickedTag").textContent=chosen?chosen.tagName:"none";
+  $("stackInfo").textContent=stack.length?(idx+1)+" / "+stack.length:"0 / 0";
+  renderHits(); buttons();
+}
+function select(i){ if(!stack.length)return; idx=(i+stack.length)%stack.length; choose(stack[idx]); }
+function cycle(step){ if(stack.length)select(idx+step); }
+
+function collect(evt){
+  let out=[], seen=new Set();
+  for(let el of document.elementsFromPoint(evt.clientX,evt.clientY)){
+    if(!svg || !svg.contains(el))continue;
+    let cur=el;
+    while(cur && cur!==svg){
+      if(cur.id && cur.tagName && cur.tagName.toLowerCase()!=="title"){
+        if(!seen.has(cur.id)){seen.add(cur.id); out.push(cur);}
+        break;
+      }
+      cur=cur.parentNode;
+    }
+  }
+  return out;
+}
+function sameSpot(evt){ return last && Math.abs(evt.clientX-last.x)<4 && Math.abs(evt.clientY-last.y)<4; }
+function installSvg(){
+  svg.addEventListener("mousemove",e=>{clear("hover"); let h=collect(e); if(h[0])h[0].classList.add("hover");});
+  svg.addEventListener("mouseleave",()=>clear("hover"));
+  svg.addEventListener("click",e=>{
+    e.preventDefault(); e.stopPropagation();
+    if(sameSpot(e) && stack.length){ cycle(1); status("Cycled to "+chosen.id); return; }
+    last={x:e.clientX,y:e.clientY}; stack=collect(e); idx=stack.length?0:-1; choose(stack[idx]||null);
+    status(chosen ? "Clicked "+chosen.tagName+"#"+chosen.id+"; re-click same spot to cycle." : "No SVG ID under cursor.");
+  },true);
+}
+function sanitize(doc){
+  doc.querySelectorAll("script").forEach(e=>e.remove());
+  doc.querySelectorAll("*").forEach(e=>{for(let a of [...e.attributes]){ if(/^on/i.test(a.name))e.removeAttribute(a.name); }});
+}
+
+$("svgFile").onchange=async()=>{
+  let f=$("svgFile").files[0]; if(!f)return;
+  let doc=new DOMParser().parseFromString(await f.text(),"image/svg+xml");
+  if(doc.querySelector("parsererror")){status("Could not parse SVG.");return}
+  sanitize(doc); $("stage").innerHTML=""; $("stage").appendChild(document.importNode(doc.documentElement,true));
+  svg=$("stage").querySelector("svg"); installSvg(); highlightMapped(); status("Loaded SVG: "+f.name);
+};
+$("mapFile").onchange=async()=>{
+  let f=$("mapFile").files[0]; if(!f)return;
+  try{mapping=norm(JSON.parse(await f.text())); code=sortCodes()[0]||null; update(); status("Loaded mapping: "+f.name);}
+  catch(e){status("Could not parse mapping JSON: "+e.message);}
+};
+$("filter").oninput=refreshCodes;
+$("codes").onchange=()=>{code=$("codes").value; update();};
+$("nextHit").onclick=()=>cycle(1); $("prevHit").onclick=()=>cycle(-1);
+$("add").onclick=()=>{if(!code||!chosen)return; if(!mapping[code])mapping[code]=[]; if(!mapping[code].includes(chosen.id))mapping[code].push(chosen.id); update(); status("Added "+chosen.id+" to "+code);};
+$("replace").onclick=()=>{if(!code||!chosen)return; mapping[code]=[chosen.id]; update(); status("Replaced "+code+" with "+chosen.id);};
+$("remove").onclick=()=>{if(!code||!chosen)return; mapping[code]=(mapping[code]||[]).filter(x=>x!==chosen.id); update(); status("Removed "+chosen.id+" from "+code);};
+$("newCode").onclick=()=>{let v=prompt("New code, e.g. A14:"); if(!v)return; code=v.trim().toUpperCase(); if(!mapping[code])mapping[code]=[]; update();};
+$("delCode").onclick=()=>{if(code&&confirm("Delete "+code+"?")){delete mapping[code]; code=sortCodes()[0]||null; update();}};
+$("apply").onclick=()=>{try{mapping=norm(JSON.parse($("json").value)); if(code&&!mapping[code])code=null; code=code||sortCodes()[0]||null; update(); status("Applied JSON edits.");}catch(e){status("Invalid JSON: "+e.message);}};
+$("download").onclick=()=>{let blob=new Blob([JSON.stringify(mapping,null,2)],{type:"application/json"}); let url=URL.createObjectURL(blob); let a=document.createElement("a"); a.href=url; a.download="measurement_id_mapping.json"; a.click(); URL.revokeObjectURL(url);};
+update();
+</script>
