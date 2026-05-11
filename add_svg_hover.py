@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Add hover/click highlighting to an SVG from an ID-to-measurement mapping.
+Generate an interactive SVG from:
+  1. an input SVG
+  2. a measurement-code -> SVG element ID mapping JSON
 
-Features:
-- hover definition -> highlight mapped SVG elements
-- hover mapped line/path -> highlight matching definition and show full label
-- click definition or mapped line/path -> copy the variable name in parentheses, e.g. bust_arc_f
-- after copying, show an in-SVG popup message
+Behavior:
+- Hover definition label -> highlight mapped line/path, no tooltip.
+- Hover diagram line/path -> highlight matching definition and show full definition tooltip.
+- Click definition label -> copy variable name and show copied popup.
+- Click diagram line/path -> copy variable name, show copied popup, and pin highlight/tooltip.
 
 Usage:
-  python add_svg_hover_with_reverse.py input.svg mapping.json output.svg
+  python add_svg_hover.py input.svg mapping.json output.svg
 """
 
 from __future__ import annotations
@@ -23,8 +25,9 @@ from typing import Any, Dict, Iterable, List
 
 from lxml import etree
 
-
 SVG_NS = "http://www.w3.org/2000/svg"
+SODIPODI_NS = "http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+NS = {"svg": SVG_NS, "sodipodi": SODIPODI_NS}
 
 
 def qn(tag: str) -> str:
@@ -63,7 +66,9 @@ def normalize_mapping(raw: Any) -> Dict[str, List[str]]:
         raw = raw["mapping"]
 
     if not isinstance(raw, dict):
-        raise ValueError("Mapping JSON must be an object, or an object with a 'mapping' object.")
+        raise ValueError(
+            "Mapping JSON must be an object, or an object with a 'mapping' object."
+        )
 
     mapping: Dict[str, List[str]] = {}
     for code, ids in raw.items():
@@ -75,7 +80,9 @@ def normalize_mapping(raw: Any) -> Dict[str, List[str]]:
         elif isinstance(ids, list):
             id_list = [str(x).strip() for x in ids if str(x).strip()]
         else:
-            raise ValueError(f"Mapping value for {code!r} must be a string or a list of strings.")
+            raise ValueError(
+                f"Mapping value for {code!r} must be a string or a list of strings."
+            )
 
         seen = set()
         clean = []
@@ -84,7 +91,6 @@ def normalize_mapping(raw: Any) -> Dict[str, List[str]]:
                 clean.append(item)
                 seen.add(item)
         mapping[code] = clean
-
     return mapping
 
 
@@ -93,18 +99,19 @@ def find_by_id(root: etree._Element, element_id: str) -> etree._Element | None:
     return matches[0] if matches else None
 
 
-def is_definition_candidate(el: etree._Element, code: str) -> bool:
-    if local_name(el) not in {"text", "tspan"}:
-        return False
-    txt = text_content(el)
+def code_starts_text(txt: str, code: str) -> bool:
     return bool(txt and re.match(rf"^{re.escape(code)}\b", txt))
 
 
-def clean_definition_label(raw: str, code: str) -> str:
-    raw = " ".join(raw.split())
-    # If the found element is only the bold code, keep the code. Later another element may
-    # provide the full line.
-    return raw or code
+def is_single_definition_line(txt: str, code: str) -> bool:
+    """
+    True for e.g. "A01 - Height: Total (height)".
+    False for parent text that contains A01...A02...A03...
+    """
+    if not code_starts_text(txt, code):
+        return False
+    rest = txt[len(code) :]
+    return re.search(r"\b[A-Q]\d{2}\b", rest) is None
 
 
 def variable_from_label(label: str) -> str:
@@ -112,23 +119,64 @@ def variable_from_label(label: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-def collect_definition_labels(root: etree._Element, mapping: Dict[str, List[str]]) -> Dict[str, str]:
+def collect_definition_labels(
+    root: etree._Element, mapping: Dict[str, List[str]]
+) -> Dict[str, str]:
     labels: Dict[str, str] = {}
-    for code in mapping:
-        candidates = []
-        for el in root.xpath(".//*[local-name()='text' or local-name()='tspan']"):
-            if is_definition_candidate(el, code):
-                txt = clean_definition_label(text_content(el), code)
-                candidates.append(txt)
 
-        # Prefer the longest candidate because the parent text/tspan usually contains
-        # "G12 - Bust arc front (bust_arc_f)" while the bold child may only contain "G12".
+    all_text = root.xpath(".//*[local-name()='text' or local-name()='tspan']")
+    for code in mapping:
+        candidates: List[tuple[int, str]] = []
+
+        for el in all_text:
+            txt = text_content(el)
+            if not code_starts_text(txt, code):
+                continue
+
+            score = 0
+
+            # Strongly prefer individual Inkscape/Sodipodi text lines.
+            if el.get(f"{{{SODIPODI_NS}}}role") == "line":
+                score += 100
+
+            # Prefer actual full definitions with a variable in parentheses.
+            if variable_from_label(txt):
+                score += 80
+
+            # Avoid huge parent text nodes containing many definitions.
+            if is_single_definition_line(txt, code):
+                score += 50
+            else:
+                score -= 100
+
+            # Prefer labels that have more than only "A01".
+            if len(txt) > len(code) + 4:
+                score += 20
+
+            candidates.append((score, txt))
+
         if candidates:
-            labels[code] = max(candidates, key=len)
+            candidates.sort(key=lambda item: (item[0], len(item[1])), reverse=True)
+            labels[code] = candidates[0][1]
         else:
             labels[code] = code
 
     return labels
+
+
+def is_definition_candidate(el: etree._Element, code: str) -> bool:
+    if local_name(el) not in {"text", "tspan"}:
+        return False
+    txt = text_content(el)
+    if not code_starts_text(txt, code):
+        return False
+
+    # Annotate single line labels and short code-only tspans.
+    if is_single_definition_line(txt, code):
+        return True
+    if txt == code:
+        return True
+    return False
 
 
 def annotate_definition_text(root: etree._Element, code: str, label: str) -> int:
@@ -148,7 +196,12 @@ def annotate_definition_text(root: etree._Element, code: str, label: str) -> int
 
         style = el.get("style") or ""
         if "cursor:" not in style:
-            el.set("style", style + (";" if style and not style.endswith(";") else "") + "cursor:pointer")
+            el.set(
+                "style",
+                style
+                + (";" if style and not style.endswith(";") else "")
+                + "cursor:pointer",
+            )
 
         count += 1
 
@@ -156,7 +209,6 @@ def annotate_definition_text(root: etree._Element, code: str, label: str) -> int
 
 
 def ensure_title(el: etree._Element, label: str) -> None:
-    # Replace old generated title if present; otherwise add one.
     for child in el:
         if local_name(child) == "title":
             child.text = label
@@ -166,7 +218,9 @@ def ensure_title(el: etree._Element, label: str) -> None:
     el.insert(0, title)
 
 
-def inject_style_and_script(root: etree._Element, highlight_color: str, definition_color: str) -> None:
+def inject_style_and_script(
+    root: etree._Element, highlight_color: str, definition_color: str
+) -> None:
     css = f"""
 .measure-definition {{
   cursor: pointer;
@@ -222,14 +276,8 @@ tspan.measure-target.is-highlighted {{
   const svg = document.documentElement;
   const SVG_NS = 'http://www.w3.org/2000/svg';
 
-  let tooltipGroup = null;
-  let tooltipRect = null;
-  let tooltipText = null;
-
-  let popupGroup = null;
-  let popupRect = null;
-  let popupText = null;
-  let popupTimer = null;
+  let tooltipGroup = null, tooltipRect = null, tooltipText = null;
+  let popupGroup = null, popupRect = null, popupText = null, popupTimer = null;
 
   function codesFor(el) {
     const raw = el.getAttribute('data-measures') || el.getAttribute('data-measure') || '';
@@ -240,27 +288,43 @@ tspan.measure-target.is-highlighted {{
     return codesFor(el).includes(code);
   }
 
-  function firstElementForCode(code) {
-    const all = document.querySelectorAll('[data-measures], [data-measure]');
+  function elementsForCode(code, selector) {
+    const all = document.querySelectorAll(selector || '[data-measures], [data-measure]');
+    const out = [];
     for (const el of all) {
-      if (hasCode(el, code)) return el;
+      if (hasCode(el, code)) out.push(el);
     }
-    return null;
+    return out;
   }
 
   function labelForCode(code) {
-    const el = firstElementForCode(code);
-    return (el && el.getAttribute('data-measure-label')) || code;
+    // Prefer definition labels because they are the source of truth for the full text.
+    const definitions = elementsForCode(code, '.measure-definition');
+    for (const el of definitions) {
+      const label = el.getAttribute('data-measure-label');
+      if (label && label !== code) return label;
+    }
+
+    const targets = elementsForCode(code, '.measure-target');
+    for (const el of targets) {
+      const label = el.getAttribute('data-measure-label');
+      if (label && label !== code) return label;
+    }
+
+    return code;
   }
 
   function variableForCode(code) {
-    const el = firstElementForCode(code);
-    if (!el) return '';
+    const definitions = elementsForCode(code, '.measure-definition');
+    const targets = elementsForCode(code, '.measure-target');
+    const all = definitions.concat(targets);
 
-    const explicit = el.getAttribute('data-measure-var');
-    if (explicit) return explicit;
+    for (const el of all) {
+      const explicit = el.getAttribute('data-measure-var');
+      if (explicit) return explicit;
+    }
 
-    const label = el.getAttribute('data-measure-label') || '';
+    const label = labelForCode(code);
     const match = label.match(/\(([^()]+)\)\s*$/);
     return match ? match[1].trim() : '';
   }
@@ -280,7 +344,7 @@ tspan.measure-target.is-highlighted {{
     group.appendChild(rect);
     group.appendChild(text);
     svg.appendChild(group);
-    return {group, rect, text};
+    return {group: group, rect: rect, text: text};
   }
 
   function ensureTooltip() {
@@ -377,7 +441,6 @@ tspan.measure-target.is-highlighted {{
 
   function showPopup(message, evt, sourceEl) {
     ensurePopup();
-
     popupGroup.style.display = 'inline';
     sizeOverlay(popupRect, popupText, message);
 
@@ -398,6 +461,7 @@ tspan.measure-target.is-highlighted {{
     textarea.style.left = '-9999px';
     document.body.appendChild(textarea);
     textarea.select();
+
     try {
       document.execCommand('copy');
       document.body.removeChild(textarea);
@@ -427,6 +491,7 @@ tspan.measure-target.is-highlighted {{
     copyText(variable).then(function(){
       showPopup('Copied: ' + variable, evt, sourceEl);
     }).catch(function(){
+      // Still show the value, so the user can manually copy it if the browser blocks clipboard.
       showPopup('Copy failed: ' + variable, evt, sourceEl);
     });
   }
@@ -449,12 +514,18 @@ tspan.measure-target.is-highlighted {{
       el.addEventListener('mouseenter', function(evt){
         if (!pinned) {
           highlight(codes[0]);
-          showTooltip(codes[0], evt, el);
+
+          // Tooltip is only for diagram paths/targets, not definition labels.
+          if (el.classList.contains('measure-target')) {
+            showTooltip(codes[0], evt, el);
+          }
         }
       });
 
       el.addEventListener('mousemove', function(evt){
-        if (!pinned) showTooltip(codes[0], evt, el);
+        if (!pinned && el.classList.contains('measure-target')) {
+          showTooltip(codes[0], evt, el);
+        }
       });
 
       el.addEventListener('mouseleave', function(){
@@ -464,10 +535,12 @@ tspan.measure-target.is-highlighted {{
         }
       });
 
-      el.addEventListener('focus', function(){
+      el.addEventListener('focus', function(evt){
         if (!pinned) {
           highlight(codes[0]);
-          showTooltip(codes[0], null, el);
+          if (el.classList.contains('measure-target')) {
+            showTooltip(codes[0], evt, el);
+          }
         }
       });
 
@@ -482,10 +555,16 @@ tspan.measure-target.is-highlighted {{
         evt.stopPropagation();
         const code = codes[0];
 
-        // click behavior:
-        // 1. pin/unpin highlight
-        // 2. copy variable from the full label, e.g. bust_arc_f
-        pin(pinned === code ? null : code, evt, el);
+        if (el.classList.contains('measure-target')) {
+          // Diagram path: pin highlight and show full definition tooltip.
+          pin(pinned === code ? null : code, evt, el);
+        } else {
+          // Definition label: highlight only; no tooltip.
+          pinned = null;
+          hideTooltip();
+          highlight(code);
+        }
+
         copyVariableForCode(code, evt, el);
       });
     });
@@ -585,7 +664,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("output_svg", type=Path)
     parser.add_argument("--highlight-color", default="#ff4d00")
     parser.add_argument("--definition-color", default="#cc3300")
-    parser.add_argument("--strict", action="store_true", help="Exit with code 2 if any mapped SVG id is missing.")
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit with code 2 if any mapped SVG id is missing.",
+    )
     args = parser.parse_args(argv)
 
     return add_hover_to_svg(
